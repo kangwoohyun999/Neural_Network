@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Fashion-MNIST 실험 스크립트 (BatchNorm 제거 버전)
-비교 항목:
- - 가중치 초기화: standard normal, Xavier (Glorot), He (Kaiming)
- - Optimizer: SGD, SGD+Momentum, Adam
-
-출력:
- - 각 실험의 학습/검증 기록(로그)
- - 최종 validation accuracy 요약 표 출력
- - 각 실험별 best model 저장(.pt)
- - results.csv 생성
-"""
-
 import os
 import copy
 import csv
