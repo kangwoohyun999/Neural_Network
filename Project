@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Fashion-MNIST 실험 스크립트 (BatchNorm 제거 버전)
+비교 항목:
+ - 가중치 초기화: standard normal, Xavier (Glorot), He (Kaiming)
+ - Optimizer: SGD, SGD+Momentum, Adam
+
+출력:
+ - 각 실험의 학습/검증 기록(로그)
+ - 최종 validation accuracy 요약 표 출력
+ - 각 실험별 best model 저장(.pt)
+ - results.csv 생성
+"""
+
+import os
+import copy
+import csv
+import datetime
+import itertools
+import random
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+import torchvision
+from torchvision import transforms
+import numpy as np
+
+# ------- 설정 -------
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+OUT_DIR = "experiment_results_no_bn"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 하이퍼파라미터
+BATCH_SIZE = 128
+EPOCHS = 10
+LR = 0.01
+MOMENTUM = 0.9
+WEIGHT_DECAY = 1e-4
+
+# 실험 조합
+inits = ["normal", "xavier", "he"]
+optimizers = ["sgd", "momentum", "adam"]
+
+# ------- 데이터 준비 -------
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+trainval_dataset = torchvision.datasets.FashionMNIST(root="./data", train=True, download=True, transform=transform)
+test_dataset = torchvision.datasets.FashionMNIST(root="./data", train=False, download=True, transform=transform)
+
+train_size = 55000
+val_size = len(trainval_dataset) - train_size
+train_dataset, val_dataset = random_split(trainval_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(SEED))
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+# ------- 모델 정의 (BN 제거) -------
+class SimpleFC(nn.Module):
+    def __init__(self, hidden_units=256, num_hidden_layers=3):
+        """
+        Fully-connected 모델 (BN 미적용)
+        """
+        super().__init__()
+        layers = []
+        in_dim = 28*28
+        for i in range(num_hidden_layers):
+            layers.append(nn.Linear(in_dim, hidden_units))
+            layers.append(nn.ReLU(inplace=True))
+            in_dim = hidden_units
+        
+        layers.append(nn.Linear(in_dim, 10))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.net(x)
+
+# ------- 초기화 함수 -------
+def apply_init(model, init_type="normal"):
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            if init_type == "normal":
+                nn.init.normal_(m.weight, mean=0.0, std=0.05)
+            elif init_type == "xavier":
+                nn.init.xavier_uniform_(m.weight)
+            elif init_type == "he":
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            else:
+                raise ValueError(f"Unknown init: {init_type}")
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+
+# ------- 학습 루프 -------
+def train_one_epoch(model, dataloader, criterion, optimizer):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    for x, y in dataloader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * x.size(0)
+        _, preds = out.max(1)
+        correct += preds.eq(y).sum().item()
+        total += x.size(0)
+    return running_loss / total, correct / total
+
+def evaluate(model, dataloader, criterion):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            out = model(x)
+            loss = criterion(out, y)
+            running_loss += loss.item() * x.size(0)
+            _, preds = out.max(1)
+            correct += preds.eq(y).sum().item()
+            total += x.size(0)
+    return running_loss / total, correct / total
+
+# ------- 실험 실행 -------
+results = []
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+for init_type, opt_name in itertools.product(inits, optimizers):
+    run_name = f"init={init_type}__opt={opt_name}__{timestamp}"
+    print("="*80)
+    print("RUN:", run_name)
+
+    # 모델
+    model = SimpleFC(hidden_units=256, num_hidden_layers=3).to(DEVICE)
+    apply_init(model, init_type)
+
+    # criterion & optimizer
+    criterion = nn.CrossEntropyLoss()
+    if opt_name == "sgd":
+        optimizer = optim.SGD(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    elif opt_name == "momentum":
+        optimizer = optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    elif opt_name == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    else:
+        raise ValueError(opt_name)
+
+    best_val_acc = 0.0
+    best_model_wts = copy.deepcopy(model.state_dict())
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+
+    for epoch in range(1, EPOCHS+1):
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc = evaluate(model, val_loader, criterion)
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_wts = copy.deepcopy(model.state_dict())
+
+        print(f"[{run_name}] Epoch {epoch}/{EPOCHS}   Train {train_acc:.4f} | Val {val_acc:.4f}")
+
+    # 저장
+    model.load_state_dict(best_model_wts)
+    model_path = os.path.join(OUT_DIR, f"{run_name}.pt")
+    torch.save(model.state_dict(), model_path)
+
+    # test 성능
+    test_loss, test_acc = evaluate(model, test_loader, criterion)
+
+    print(f"-> Best val acc: {best_val_acc:.4f} | Test acc: {test_acc:.4f}")
+
+    results.append({
+        "run": run_name,
+        "init": init_type,
+        "optimizer": opt_name,
+        "best_val_acc": best_val_acc,
+        "test_acc": test_acc,
+        "model_path": model_path,
+        "history": history
+    })
+
+# ------- CSV 저장 -------
+csv_path = os.path.join(OUT_DIR, f"results_{timestamp}.csv")
+with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["run", "init", "optimizer", "best_val_acc", "test_acc", "model_path"])
+    for r in results:
+        w.writerow([r["run"], r["init"], r["optimizer"], f"{r['best_val_acc']:.6f}", f"{r['test_acc']:.6f}", r["model_path"]])
+
+print("\n===== SUMMARY =====")
+for r in sorted(results, key=lambda x: x["best_val_acc"], reverse=True):
+    print(f"{r['run']}: val={r['best_val_acc']:.4f}, test={r['test_acc']:.4f}")
+
+print(f"\nSaved CSV: {csv_path}")
